@@ -1,8 +1,10 @@
 #!/bin/bash
 
 # set -e
+exec 3>&1 # make stdout available as file descriptor 3 for the result
+exec 1>&2 # redirect all output to stderr for logging
 # Read the input JSON from stdin
-input=$(cat -)
+input="$(cat <&0)"
 
 # Extract the values from the JSON
 domain=$(jq -r '.source.domain' <<< "$input")
@@ -16,12 +18,12 @@ aws_secret_access_key=$(jq -r '.source.aws_secret_access_key' <<< "$input")
 aws_role_arn=$(jq -r '.source.aws_role_arn' <<< "$input")
 aws_region=$(jq -r '.source.aws_region' <<< "$input")
 
-# Decode and save the custom CA certificate to a file
-echo "$ca_cert_b64" | base64 -d > "/usr/local/share/ca-certificates/custom-ca.crt"
-echo "$ca_cert_b64" | base64 -d > /etc/ssl/certs/ca-certificates.crt
+# # Decode and save the custom CA certificate to a file
+# echo "$ca_cert_b64" | base64 -d > "/usr/local/share/ca-certificates/custom-ca.crt"
+# echo "$ca_cert_b64" | base64 -d > /etc/ssl/certs/ca-certificates.crt
 
-# Update the system's certificate trust store
-update-ca-certificates
+# # Update the system's certificate trust store
+# update-ca-certificates
 
 assume_role() {
     local AWS_ACCESS_KEY_ID="$1"
@@ -76,7 +78,7 @@ generate_certificate() {
     if [ "$alt_domains" == "" ]; then
         /opt/resource/./acme.sh --issue --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please -d "$domain" --server "$certificate_url" >&2
     else
-        /opt/resource/./acme.sh --issue --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please -d "$domain" "$alt_domains" --server "$certificate_url" >&2
+        /opt/resource/./acme.sh --issue --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please -d "$domain" $alt_domains --server "$certificate_url" >&2
     fi
 
     local cert_dir="$HOME/.acme.sh/${domain}_ecc"
@@ -88,7 +90,10 @@ generate_certificate() {
 
     #update certificates in s3 bucket
     aws s3 cp --recursive "$cert_dir" "s3://${s3_bucket}/certificates/${domain}_ecc"
-    echo "{ \"ref\" : { \"version\" : \"${cert_hash}\" }}"
+    # echo "{ \"ref\" : [ \"${cert_hash}\" ]}" >&3
+    jq -n --arg cert_hash "$cert_hash" '[{ref: $cert_hash}]' >&3
+
+
 
 }
 
@@ -105,28 +110,22 @@ generate_domains() {
     done
 
     # Return the formatted domain string
-    echo "$formatted_domains"
+    echo "$formatted_domains" | xargs
 }
 
-# Main entry point
-main() {
-    echo $domain
-    echo $alt_domains
-    assume_role "$aws_access_key_id" "$aws_secret_access_key" "$aws_role_arn" "$aws_region"
+echo $domain
+echo $alt_domains
+assume_role "$aws_access_key_id" "$aws_secret_access_key" "$aws_role_arn" "$aws_region"
 
-    #get certificates if they exist
-    check_bucket_for_certificates "$s3_bucket" "$domain"
-    # generate a command we can use in acme from our alternate names
-    if [ "$alt_domains" == "null" ]; then
-        echo "no alternate domains required"
-        alt_domain_cmd=""
-    else
-        echo "generating command for alternate domains"
-        alt_domain_cmd=$(generate_domains "$alt_domains")
-    fi
-    #we can always call this because acme will decide when to generate a new certificate
-    generate_certificate "$domain" "$certificate_url" "$alt_domain_cmd"
-
-}
-
-main "$@"
+#get certificates if they exist
+check_bucket_for_certificates "$s3_bucket" "$domain"
+# generate a command we can use in acme from our alternate names
+if [ "$alt_domains" == "null" ]; then
+    echo "no alternate domains required"
+    alt_domain_cmd=""
+else
+    echo "generating command for alternate domains"
+    alt_domain_cmd=$(generate_domains "$alt_domains")
+fi
+#we can always call this because acme will decide when to generate a new certificate
+generate_certificate "$domain" "$certificate_url" "$alt_domain_cmd"

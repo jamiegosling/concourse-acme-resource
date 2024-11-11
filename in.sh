@@ -1,8 +1,10 @@
 #!/bin/bash
 
 set -e
+exec 3>&1 # make stdout available as file descriptor 3 for the result
+exec 1>&2 # redirect all output to stderr for logging
 # Read the input JSON from stdin
-input=$(cat -)
+input="$(cat <&0)"
 
 # Extract the values from the JSON
 domain=$(jq -r '.source.domain' <<< "$input")
@@ -14,12 +16,14 @@ aws_secret_access_key=$(jq -r '.source.aws_secret_access_key' <<< "$input")
 aws_role_arn=$(jq -r '.source.aws_role_arn' <<< "$input")
 aws_region=$(jq -r '.source.aws_region' <<< "$input")
 
-# Decode and save the custom CA certificate to a file
-echo "$ca_cert_b64" | base64 -d > "/usr/local/share/ca-certificates/custom-ca.crt"
-echo "$ca_cert_b64" | base64 -d > /etc/ssl/certs/ca-certificates.crt
+destination_dir=$1
 
-# Update the system's certificate trust store
-update-ca-certificates
+# # Decode and save the custom CA certificate to a file
+# echo "$ca_cert_b64" | base64 -d > "/usr/local/share/ca-certificates/custom-ca.crt"
+# echo "$ca_cert_b64" | base64 -d > /etc/ssl/certs/ca-certificates.crt
+
+# # Update the system's certificate trust store
+# update-ca-certificates
 
 assume_role() {
     local AWS_ACCESS_KEY_ID="$1"
@@ -56,7 +60,7 @@ check_bucket_for_certificates() {
     echo $exit_code
     if [ $exit_code -eq 0 ]; then
         echo "Certificate found in S3 bucket"
-        aws s3 cp "s3://${bucket}/certificates/${domain}_ecc" "${domain}_ecc" --recursive
+        aws s3 cp "s3://${bucket}/certificates/${domain}_ecc" "${destination_dir}/${domain}_ecc" --recursive
         return 0
     else
         echo "Certificate not found in S3 bucket"
@@ -71,25 +75,22 @@ generate_certificate_hash() {
 }
 
 
-# Main entry point
-main() {
-    echo $domain
-    echo $alt_domains
-    echo "looking for $version"
-    assume_role "$aws_access_key_id" "$aws_secret_access_key" "$aws_role_arn" "$aws_region"
 
-    #get certificates (they should already exist from check)
-    check_bucket_for_certificates "$s3_bucket" "$domain"
-    cert_hash=$(generate_certificate_hash "${domain}_ecc/$domain.cer")
+echo $domain
+echo $alt_domains
+echo "looking for $version"
+assume_role "$aws_access_key_id" "$aws_secret_access_key" "$aws_role_arn" "$aws_region"
 
-    if [ "$cert_hash" == "$version" ]; then
-        echo "Found version $version in S3 bucket"
-        exit 0
-    else
-        echo "Version $version does not exist in S3 bucket"
-        exit 1
-    fi
+#get certificates (they should already exist from check)
+check_bucket_for_certificates "$s3_bucket" "$domain"
+cert_hash=$(generate_certificate_hash "${destination_dir}/${domain}_ecc/$domain.cer")
 
-}
+if [ "$cert_hash" == "$version" ]; then
+    echo "Found version $version in S3 bucket"
+    # echo "{ \"ref\" : [ \"${cert_hash}\" ]}" >&3
+    jq -n --arg cert_hash "$cert_hash" '{version: { ref: $cert_hash}}' >&3
 
-main "$@"
+else
+    echo "Version $version does not exist in S3 bucket"
+    exit 1
+fi
