@@ -1,0 +1,1 @@
+docker run --rm -i concourse-acme-resource /opt/resource/in . < in_payload.json
