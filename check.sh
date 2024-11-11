@@ -90,7 +90,6 @@ generate_certificate() {
 
     #update certificates in s3 bucket
     aws s3 cp --recursive "$cert_dir" "s3://${s3_bucket}/certificates/${domain}_ecc"
-    # echo "{ \"ref\" : [ \"${cert_hash}\" ]}" >&3
     jq -n --arg cert_hash "$cert_hash" '[{ref: $cert_hash}]' >&3
 
 
