@@ -80,7 +80,8 @@ generate_certificate() {
     else
         /opt/resource/./acme.sh --issue --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please -d "$domain" $alt_domains --server "$certificate_url" >&2
     fi
-
+    exit_code=$?
+    echo "exit code: $exit_code"
     local cert_dir="$HOME/.acme.sh/${domain}_ecc"
     local cert_file="$cert_dir/$domain.cer"
     local key_file="$cert_dir/$domain.key"
@@ -89,7 +90,15 @@ generate_certificate() {
     local cert_hash=$(echo -n "$b64_cert" | sha256sum | awk '{print $1}')
 
     #update certificates in s3 bucket
-    aws s3 cp --recursive "$cert_dir" "s3://${s3_bucket}/certificates/${domain}_ecc"
+    if [ $exit_code -eq 0 ]; then
+        echo "certificate has changed, uploading to s3"
+        aws s3 cp --recursive "$cert_dir" "s3://${s3_bucket}/certificates/${domain}_ecc"
+    elif [ $exit_code -eq 2 ]; then
+        echo "certificate has not changed, not uploading to s3"
+    else
+        echo "error generating certificate"
+        exit 1
+    fi
     jq -n --arg cert_hash "$cert_hash" '[{ref: $cert_hash}]' >&3
 
 
