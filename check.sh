@@ -1,8 +1,10 @@
 #!/bin/bash
+#check
+set -e
 
-# set -e
-exec 3>&1 # make stdout available as file descriptor 3 for the result
-exec 1>&2 # redirect all output to stderr for logging
+exec 3>&1 # Make stdout available as file descriptor 3 for the result
+exec 1>&2 # Redirect all output to stderr for logging
+
 # Read the input JSON from stdin
 input="$(cat <&0)"
 
@@ -18,12 +20,12 @@ aws_secret_access_key=$(jq -r '.source.aws_secret_access_key' <<< "$input")
 aws_role_arn=$(jq -r '.source.aws_role_arn' <<< "$input")
 aws_region=$(jq -r '.source.aws_region' <<< "$input")
 
-# # Decode and save the custom CA certificate to a file
-# echo "$ca_cert_b64" | base64 -d > "/usr/local/share/ca-certificates/custom-ca.crt"
-# echo "$ca_cert_b64" | base64 -d > /etc/ssl/certs/ca-certificates.crt
-
-# # Update the system's certificate trust store
-# update-ca-certificates
+# Directory to store certificates temporarily
+temp_dir=$(mktemp -d)
+cleanup() {
+    rm -rf "$temp_dir"
+}
+trap cleanup EXIT
 
 assume_role() {
     local AWS_ACCESS_KEY_ID="$1"
@@ -33,86 +35,137 @@ assume_role() {
 
     echo "Assuming role $aws_role_arn"
 
-    aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
-    aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
-    aws configure set aws_default_region $aws_region
+    aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
+    aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
+    aws configure set aws_default_region "$aws_region"
 
-    local ASSUME_ROLE_OUTPUT=$(aws sts assume-role --role-arn $aws_role_arn --role-session-name acme-resource-session --duration-seconds 900)
+    local ASSUME_ROLE_OUTPUT
+    ASSUME_ROLE_OUTPUT=$(aws sts assume-role --role-arn "$aws_role_arn" --role-session-name acme-resource-session --duration-seconds 900)
 
     # Extract the credentials from the AssumeRole output
-    local ASSUMED_ACCESS_KEY_ID=$(echo $ASSUME_ROLE_OUTPUT | jq -r .Credentials.AccessKeyId)
-    local ASSUMED_SECRET_ACCESS_KEY=$(echo $ASSUME_ROLE_OUTPUT | jq -r .Credentials.SecretAccessKey)
-    local ASSUMED_SESSION_TOKEN=$(echo $ASSUME_ROLE_OUTPUT | jq -r .Credentials.SessionToken)
+    local ASSUMED_ACCESS_KEY_ID
+    ASSUMED_ACCESS_KEY_ID=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r .Credentials.AccessKeyId)
+    local ASSUMED_SECRET_ACCESS_KEY
+    ASSUMED_SECRET_ACCESS_KEY=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r .Credentials.SecretAccessKey)
+    local ASSUMED_SESSION_TOKEN
+    ASSUMED_SESSION_TOKEN=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r .Credentials.SessionToken)
 
-    aws configure set aws_access_key_id $ASSUMED_ACCESS_KEY_ID
-    aws configure set aws_secret_access_key $ASSUMED_SECRET_ACCESS_KEY
-    aws configure set aws_session_token $ASSUMED_SESSION_TOKEN
+    aws configure set aws_access_key_id "$ASSUMED_ACCESS_KEY_ID"
+    aws configure set aws_secret_access_key "$ASSUMED_SECRET_ACCESS_KEY"
+    aws configure set aws_session_token "$ASSUMED_SESSION_TOKEN"
+}
+
+list_versions() {
+    local bucket="$1"
+    local key="$2"
+
+    # echo "Listing all versions for key: $key in bucket: $bucket"
+
+    # Initialize variables
+    continuation_token=""
+    versions=()
+
+    while : ; do
+        if [ -z "$continuation_token" ]; then
+            response=$(aws s3api list-object-versions --bucket "$bucket" --prefix "$key" --query 'Versions[].VersionId' --output text)
+        else
+            response=$(aws s3api list-object-versions --bucket "$bucket" --prefix "$key" --continuation-token "$continuation_token" --query 'Versions[].VersionId' --output text)
+        fi
+
+        # Add versions to the array
+        while IFS= read -r version; do
+            # Remove surrounding quotes
+            clean_version=${version//\"/}
+            versions+=("$clean_version")
+        done <<< "$response"
+
+        # Check if there's a NextContinuationToken
+        continuation_token=$(aws s3api list-object-versions --bucket "$bucket" --prefix "$key" --query 'NextContinuationToken' --output text)
+        if [ "$continuation_token" == "None" ] || [ -z "$continuation_token" ]; then
+            break
+        fi
+    done
+
+    # Remove duplicates and sort (optional)
+    unique_versions=($(printf "%s\n" "${versions[@]}" | sort | uniq))
+
+    echo "${unique_versions[@]}"
 }
 
 check_bucket_for_certificates() {
     local bucket="$1"
     local domain="$2"
-
+    local cert_dir="$HOME/.acme.sh/${domain}_ecc"
     echo "Checking for certificates for $domain in S3 bucket $bucket"
-    # aws s3 ls "s3://${bucket}/certificates/${domain}_ecc" > /dev/null
-    aws s3 ls "s3://${bucket}/certificates/${domain}_ecc"
-    exit_code=$?
-    echo $exit_code
-    if [ $exit_code -eq 0 ]; then
-        echo "Certificate found in S3 bucket"
-        aws s3 cp "s3://${bucket}/certificates/${domain}_ecc" "$HOME/.acme.sh/${domain}_ecc" --recursive
+
+    # Define the key for the certificate bundle
+    s3_key="certificates/${domain}_ecc.zip"
+
+    # Check if the object exists
+    if aws s3api head-object --bucket "$bucket" --key "$s3_key" > /dev/null 2>&1; then
+        aws s3 cp "s3://${bucket}/${s3_key}" "${domain}_ecc.zip"
+        mkdir -p $cert_dir
+        unzip "${domain}_ecc.zip" -d "$cert_dir"
+        echo "Certificate bundle found in S3 bucket"
         return 0
     else
-        echo "Certificate not found in S3 bucket"
+        echo "Certificate bundle not found in S3 bucket"
         return 1
     fi
 }
 
-# Function to generate/renew certificate and provide output
 generate_certificate() {
     local domain="$1"
     local certificate_url="$2"
     local alt_domains="$3"
 
-    echo "$alt_domains"
-    if [ "$alt_domains" == "" ]; then
+    cd "$temp_dir"
+    echo "Alt Domains: $alt_domains"
+    set +e
+    if [ -z "$alt_domains" ] || [ "$alt_domains" == "null" ]; then
         /opt/resource/./acme.sh --issue --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please -d "$domain" --server "$certificate_url" >&2
     else
         /opt/resource/./acme.sh --issue --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please -d "$domain" $alt_domains --server "$certificate_url" >&2
     fi
     exit_code=$?
-    echo "exit code: $exit_code"
+    set -e
+    echo "acme.sh exit code: $exit_code"
+
     local cert_dir="$HOME/.acme.sh/${domain}_ecc"
     local cert_file="$cert_dir/$domain.cer"
     local key_file="$cert_dir/$domain.key"
-    local b64_cert=$(base64 -w 0 "$cert_file")
-    local b64_key=$(base64 -w 0 "$key_file")
-    local cert_hash=$(echo -n "$b64_cert" | sha256sum | awk '{print $1}')
 
-    #update certificates in s3 bucket
-    if [ $exit_code -eq 0 ]; then
-        echo "certificate has changed, uploading to s3"
-        aws s3 cp --recursive "$cert_dir" "s3://${s3_bucket}/certificates/${domain}_ecc"
-    elif [ $exit_code -eq 2 ]; then
-        echo "certificate has not changed, not uploading to s3"
+    if [ "$exit_code" -eq 0 ]; then
+        echo "Certificate has changed, preparing to upload to S3"
+        # Create a zip archive of the certificate directory
+        zip_file="$temp_dir/${domain}_ecc.zip"
+        zip -j -r "$zip_file" "$cert_dir"/*
+
+        # Upload the zip to S3
+        aws s3 cp "$zip_file" "s3://${s3_bucket}/certificates/${domain}_ecc.zip"
+
+        # Retrieve the version of the uploaded zip
+        version=$(aws s3api head-object --bucket "$s3_bucket" --key "certificates/${domain}_ecc.zip" --query VersionId --output text)
+        # Remove quotes from version if present
+        version=${version//\"/}
+
+        echo "version of uploaded zip: $version"
+
+    elif [ "$exit_code" -eq 2 ]; then
+        echo "Certificate has not changed"
     else
-        echo "error generating certificate"
+        echo "Error generating certificate"
         exit 1
     fi
-    jq -n --arg cert_hash "$cert_hash" '[{ref: $cert_hash}]' >&3
-
-
-
 }
 
 generate_domains() {
-    local domain_list=$1
+    local domain_list="$1"
     local formatted_domains=""
 
-    # Split the domain list by commas (if any) and loop over each domain
+    # Split the domain list by commas
     IFS=',' read -ra domains <<< "$domain_list"
 
-    # If domain_list is empty or has one domain, handle both cases
     for domain in "${domains[@]}"; do
         formatted_domains+=" -d $domain"
     done
@@ -121,19 +174,46 @@ generate_domains() {
     echo "$formatted_domains" | xargs
 }
 
-echo $domain
-echo $alt_domains
+# Main Execution Flow
+
+echo "Domain: $domain"
+echo "Alt Domains: $alt_domains"
+
 assume_role "$aws_access_key_id" "$aws_secret_access_key" "$aws_role_arn" "$aws_region"
 
-#get certificates if they exist
-check_bucket_for_certificates "$s3_bucket" "$domain"
-# generate a command we can use in acme from our alternate names
-if [ "$alt_domains" == "null" ]; then
-    echo "no alternate domains required"
+# Check if the certificate bundle exists
+check_bucket_for_certificates "$s3_bucket" "$domain" || true
+
+# Generate a command we can use in acme from our alternate names
+if [ -z "$alt_domains" ] || [ "$alt_domains" == "null" ]; then
+    echo "No alternate domains required"
     alt_domain_cmd=""
 else
-    echo "generating command for alternate domains"
+    echo "Generating command for alternate domains"
     alt_domain_cmd=$(generate_domains "$alt_domains")
 fi
-#we can always call this because acme will decide when to generate a new certificate
+
+# Generate or renew the certificate
 generate_certificate "$domain" "$certificate_url" "$alt_domain_cmd"
+
+# After uploading, list all versions and output them as versions
+s3_key="certificates/${domain}_ecc.zip"
+versions=$(list_versions "$s3_bucket" "$s3_key")
+
+if [ -z "$versions" ]; then
+    echo "No versions found for key: $s3_key"
+    jq -n '[]' >&3
+    exit 0
+fi
+
+# Prepare the JSON array of versions
+version_array=""
+for version in $versions; do
+    version_array=$(printf '%s{"ref":"%s"},' "$version_array" "$version")
+done
+
+# Remove trailing comma and wrap in square brackets
+version_array="[${version_array%,}]"
+
+# Output the JSON
+echo "$version_array" | jq '.' >&3

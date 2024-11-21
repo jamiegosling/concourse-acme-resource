@@ -1,6 +1,6 @@
 FROM alpine:latest
 
-RUN apk --update --no-cache add wget jq curl bash openssl socat ca-certificates aws-cli
+RUN apk --update --no-cache add wget jq curl bash openssl socat ca-certificates aws-cli zip unzip
 
 ADD in.sh /opt/resource/in
 ADD check.sh /opt/resource/check
