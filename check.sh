@@ -15,10 +15,11 @@ renew_days=$(jq -r '.source.renew_days' <<< "$input")
 certificate_url=$(jq -r '.source.certificate_url' <<< "$input")
 ca_cert_b64=$(jq -r '.source.ca_certificate' <<< "$input")
 s3_bucket=$(jq -r '.source.s3_bucket' <<< "$input")
-aws_access_key_id=$(jq -r '.source.aws_access_key_id' <<< "$input")
-aws_secret_access_key=$(jq -r '.source.aws_secret_access_key' <<< "$input")
 aws_role_arn=$(jq -r '.source.aws_role_arn' <<< "$input")
-aws_region=$(jq -r '.source.aws_region' <<< "$input")
+# these need to be exported for the aws cli to use them
+export AWS_ACCESS_KEY_ID=$(jq -r '.source.aws_access_key_id' <<< "$input")
+export AWS_SECRET_ACCESS_KEY=$(jq -r '.source.aws_secret_access_key' <<< "$input")
+export AWS_DEFAULT_REGION=$(jq -r '.source.aws_region' <<< "$input")
 
 # Directory to store certificates temporarily
 temp_dir=$(mktemp -d)
@@ -28,19 +29,12 @@ cleanup() {
 trap cleanup EXIT
 
 assume_role() {
-    local AWS_ACCESS_KEY_ID="$1"
-    local AWS_SECRET_ACCESS_KEY="$2"
-    local aws_role_arn="$3"
-    local aws_region="$4"
-
+    local aws_role_arn="$1"
+    local timestamp=$(date +%s)
     echo "Assuming role $aws_role_arn"
 
-    aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
-    aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
-    aws configure set aws_default_region "$aws_region"
-
     local ASSUME_ROLE_OUTPUT
-    ASSUME_ROLE_OUTPUT=$(aws sts assume-role --role-arn "$aws_role_arn" --role-session-name acme-resource-session --duration-seconds 900)
+    ASSUME_ROLE_OUTPUT=$(aws sts assume-role --role-arn "$aws_role_arn" --role-session-name "acme-resource-session-${timestamp}" --duration-seconds 900)
 
     # Extract the credentials from the AssumeRole output
     local ASSUMED_ACCESS_KEY_ID
@@ -50,9 +44,9 @@ assume_role() {
     local ASSUMED_SESSION_TOKEN
     ASSUMED_SESSION_TOKEN=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r .Credentials.SessionToken)
 
-    aws configure set aws_access_key_id "$ASSUMED_ACCESS_KEY_ID"
-    aws configure set aws_secret_access_key "$ASSUMED_SECRET_ACCESS_KEY"
-    aws configure set aws_session_token "$ASSUMED_SESSION_TOKEN"
+    export AWS_ACCESS_KEY_ID="$ASSUMED_ACCESS_KEY_ID"
+    export AWS_SECRET_ACCESS_KEY="$ASSUMED_SECRET_ACCESS_KEY"
+    export AWS_SESSION_TOKEN="$ASSUMED_SESSION_TOKEN"
 }
 
 list_versions() {
@@ -85,11 +79,38 @@ list_versions() {
             break
         fi
     done
+    unique_versions=($(printf "%s\n" "${versions[@]}"))
+    reversed_versions=($(printf "%s\n" "${unique_versions[@]}" | awk '{lines[NR]=$0} END {for (i=NR; i>0; i--) print lines[i]}'))
+    # echo "${unique_versions[@]}"
+    echo "${reversed_versions[@]}"
+}
 
-    # Remove duplicates and sort (optional)
-    unique_versions=($(printf "%s\n" "${versions[@]}" | sort | uniq))
+# Concourse can cachce resource versions, so we need to check if the version in the cache is the latest
+check_for_cached() {
+    local bucket="$1"
+    local domain="$2"
 
-    echo "${unique_versions[@]}"
+    # Define the key for the certificate bundle
+    s3_key="certificates/${domain}_ecc.zip"
+
+    echo "Checking for cached version..."
+    cached_version=$(cat /version)
+    latest_version=$(aws s3api head-object --bucket "$bucket" --key "$s3_key" | jq -r '.VersionId')
+    echo "cached version: $cached_version"
+    echo "latest version: $latest_version"
+    if [ -f "/version" ]; then
+        echo "There is a version cached, checking for newer in S3..."
+        if [ $cached_version == $latest_version ]; then
+            echo "Cache is latest version, nothing to do"
+            return 0
+        else
+            echo "Newer version available in S3, continue with check"
+            return 1
+        fi
+    else
+        echo "No version cached, continue with check"
+        return 1
+    fi
 }
 
 check_bucket_for_certificates() {
@@ -102,10 +123,11 @@ check_bucket_for_certificates() {
     s3_key="certificates/${domain}_ecc.zip"
 
     # Check if the object exists
-    if aws s3api head-object --bucket "$bucket" --key "$s3_key" > /dev/null 2>&1; then
+    #if aws s3api head-object --bucket "$bucket" --key "$s3_key" > /dev/null 2>&1; then
+    if aws s3api head-object --bucket "$bucket" --key "$s3_key" | jq -r '.VersionId' > /version 2>&1; then
         aws s3 cp "s3://${bucket}/${s3_key}" "${domain}_ecc.zip"
         mkdir -p $cert_dir
-        unzip "${domain}_ecc.zip" -d "$cert_dir"
+        unzip -o "${domain}_ecc.zip" -d "$cert_dir"
         echo "Certificate bundle found in S3 bucket"
         return 0
     else
@@ -179,22 +201,30 @@ generate_domains() {
 echo "Domain: $domain"
 echo "Alt Domains: $alt_domains"
 
-assume_role "$aws_access_key_id" "$aws_secret_access_key" "$aws_role_arn" "$aws_region"
+assume_role "$aws_role_arn"
 
-# Check if the certificate bundle exists
-check_bucket_for_certificates "$s3_bucket" "$domain" || true
+set +e
+check_for_cached "$s3_bucket" "$domain"
+cached=$?
+set -e
 
-# Generate a command we can use in acme from our alternate names
-if [ -z "$alt_domains" ] || [ "$alt_domains" == "null" ]; then
-    echo "No alternate domains required"
-    alt_domain_cmd=""
-else
-    echo "Generating command for alternate domains"
-    alt_domain_cmd=$(generate_domains "$alt_domains")
+if [ $cached -eq 1 ]; then
+    # Check if the certificate bundle exists
+    check_bucket_for_certificates "$s3_bucket" "$domain" || true
+
+    # Generate a command we can use in acme from our alternate names
+    if [ -z "$alt_domains" ] || [ "$alt_domains" == "null" ]; then
+        echo "No alternate domains required"
+        alt_domain_cmd=""
+    else
+        echo "Generating command for alternate domains"
+        alt_domain_cmd=$(generate_domains "$alt_domains")
+    fi
+
+    # Generate or renew the certificate
+    generate_certificate "$domain" "$certificate_url" "$alt_domain_cmd"
 fi
 
-# Generate or renew the certificate
-generate_certificate "$domain" "$certificate_url" "$alt_domain_cmd"
 
 # After uploading, list all versions and output them as versions
 s3_key="certificates/${domain}_ecc.zip"

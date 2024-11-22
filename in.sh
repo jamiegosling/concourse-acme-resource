@@ -13,25 +13,19 @@ domain=$(jq -r '.source.domain' <<< "$input")
 ca_cert_b64=$(jq -r '.source.ca_certificate' <<< "$input")
 version_ref=$(jq -r '.version.ref' <<< "$input")
 s3_bucket=$(jq -r '.source.s3_bucket' <<< "$input")
-aws_access_key_id=$(jq -r '.source.aws_access_key_id' <<< "$input")
-aws_secret_access_key=$(jq -r '.source.aws_secret_access_key' <<< "$input")
 aws_role_arn=$(jq -r '.source.aws_role_arn' <<< "$input")
-aws_region=$(jq -r '.source.aws_region' <<< "$input")
+# these need to be exported for the aws cli to use them
+export AWS_ACCESS_KEY_ID=$(jq -r '.source.aws_access_key_id' <<< "$input")
+export AWS_SECRET_ACCESS_KEY=$(jq -r '.source.aws_secret_access_key' <<< "$input")
+export AWS_DEFAULT_REGION=$(jq -r '.source.aws_region' <<< "$input")
 
 # this is the directory concourse provides for the output
 destination_dir=$1
 
 assume_role() {
-    local AWS_ACCESS_KEY_ID="$1"
-    local AWS_SECRET_ACCESS_KEY="$2"
-    local aws_role_arn="$3"
-    local aws_region="$4"
+    local aws_role_arn="$1"
 
     echo "Assuming role $aws_role_arn"
-
-    aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
-    aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
-    aws configure set aws_default_region "$aws_region"
 
     local ASSUME_ROLE_OUTPUT
     ASSUME_ROLE_OUTPUT=$(aws sts assume-role --role-arn "$aws_role_arn" --role-session-name acme-resource-session --duration-seconds 900)
@@ -44,9 +38,9 @@ assume_role() {
     local ASSUMED_SESSION_TOKEN
     ASSUMED_SESSION_TOKEN=$(echo "$ASSUME_ROLE_OUTPUT" | jq -r .Credentials.SessionToken)
 
-    aws configure set aws_access_key_id "$ASSUMED_ACCESS_KEY_ID"
-    aws configure set aws_secret_access_key "$ASSUMED_SECRET_ACCESS_KEY"
-    aws configure set aws_session_token "$ASSUMED_SESSION_TOKEN"
+    export AWS_ACCESS_KEY_ID="$ASSUMED_ACCESS_KEY_ID"
+    export AWS_SECRET_ACCESS_KEY="$ASSUMED_SECRET_ACCESS_KEY"
+    export AWS_SESSION_TOKEN="$ASSUMED_SESSION_TOKEN"
 }
 
 find_zip_by_version() {
@@ -69,7 +63,7 @@ find_zip_by_version() {
 echo "Domain: $domain"
 echo "Looking for version with VersionId: $version_ref"
 
-assume_role "$aws_access_key_id" "$aws_secret_access_key" "$aws_role_arn" "$aws_region"
+assume_role "$aws_role_arn"
 
 # Find the zip file with the given VersionId
 find_zip_by_version "$s3_bucket" "$version_ref" "$domain"
