@@ -101,7 +101,7 @@ check_for_cached() {
     if [ -f "/version" ]; then
         echo "There is a version cached, checking for newer in S3..."
         if [ $cached_version == $latest_version ]; then
-            echo "Cache is latest version, nothing to do"
+            echo "Cache is latest version, nothing to get from S3"
             return 0
         else
             echo "Newer version available in S3, continue with check"
@@ -212,19 +212,19 @@ if [ $cached -eq 1 ]; then
     # Check if the certificate bundle exists
     check_bucket_for_certificates "$s3_bucket" "$domain" || true
 
-    # Generate a command we can use in acme from our alternate names
-    if [ -z "$alt_domains" ] || [ "$alt_domains" == "null" ]; then
-        echo "No alternate domains required"
-        alt_domain_cmd=""
-    else
-        echo "Generating command for alternate domains"
-        alt_domain_cmd=$(generate_domains "$alt_domains")
-    fi
-
-    # Generate or renew the certificate
-    generate_certificate "$domain" "$certificate_url" "$alt_domain_cmd"
 fi
 
+# Generate a command we can use in acme from our alternate names
+if [ -z "$alt_domains" ] || [ "$alt_domains" == "null" ]; then
+    echo "No alternate domains required"
+    alt_domain_cmd=""
+else
+    echo "Generating command for alternate domains"
+    alt_domain_cmd=$(generate_domains "$alt_domains")
+fi
+
+# Generate or renew the certificate
+generate_certificate "$domain" "$certificate_url" "$alt_domain_cmd"
 
 # After uploading, list all versions and output them as versions
 s3_key="certificates/${domain}_ecc.zip"
